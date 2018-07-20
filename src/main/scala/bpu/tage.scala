@@ -26,8 +26,9 @@
 
 package boom.bpu
 
-import Chisel._
-import chisel3.core.withReset
+import chisel3._
+import chisel3.util.{log2Ceil, PriorityMux, PriorityEncoder, UIntToOH, Cat, Fill, Counter, RegEnable, PopCount, Valid}
+import chisel3.experimental.withReset
 import freechips.rocketchip.config.{Parameters, Field}
 import boom.common._
 import boom.util.{ElasticReg, Fold}
@@ -44,45 +45,36 @@ case class TageParameters(
    ubit_sz: Int = 1)
 
 class TageResp(
-   fetch_width: Int,
-   num_tables: Int,
-   max_history_length: Int,
-   max_index_sz: Int,
-   max_tag_sz: Int,
-   cntr_sz: Int,
-   ubit_sz: Int
+   val fetch_width: Int,
+   val num_tables: Int,
+   val max_history_length: Int,
+   val max_index_sz: Int,
+   val max_tag_sz: Int,
+   val cntr_sz: Int,
+   val ubit_sz: Int
    )
    extends Bundle
 {
    // which table is providing the prediction?
    val provider_hit = Bool()
-   val provider_id = UInt(width = log2Ceil(num_tables))
+   val provider_id = UInt(log2Ceil(num_tables).W)
    // which table is the alternative?
    val alt_hit = Bool()
-   val alt_id = UInt(width = log2Ceil(num_tables))
+   val alt_id = UInt(log2Ceil(num_tables).W)
 
    // What were the counter values and the u-bit values for each table?
    // Store all of these to avoid a RMW during update.
-   val tags  = Vec(num_tables, UInt(width = max_tag_sz))
-   val cntrs = Vec(num_tables, UInt(width = cntr_sz))
-   val cidxs = Vec(num_tables, UInt(width = log2Ceil(fetch_width)))
-   val ubits = Vec(num_tables, UInt(width = ubit_sz))
+   val tags  = Vec(num_tables, UInt(max_tag_sz.W))
+   val cntrs = Vec(num_tables, UInt(cntr_sz.W))
+   val cidxs = Vec(num_tables, UInt(log2Ceil(fetch_width).W))
+   val ubits = Vec(num_tables, UInt(ubit_sz.W))
 
 //   val alt_used = Bool() // did we instead use the alt table?
 
    // Only used for error checking --- recompute these during commit.
-   val debug_indexes  = Vec(num_tables, UInt(width = max_index_sz))
-   val debug_tags     = Vec(num_tables, UInt(width = max_tag_sz))
+   val debug_indexes  = Vec(num_tables, UInt(max_index_sz.W))
+   val debug_tags     = Vec(num_tables, UInt(max_tag_sz.W))
 
-   override def cloneType: this.type =
-      new TageResp(
-         fetch_width,
-         num_tables,
-         max_history_length,
-         max_index_sz,
-         max_tag_sz,
-         cntr_sz,
-         ubit_sz).asInstanceOf[this.type]
 }
 
 // provide information to the BpdResp bundle how many bits a TageResp needs
@@ -96,7 +88,7 @@ object TageBrPredictor
          fetch_width = fetchWidth,
          num_tables = params.num_tables,
          max_history_length = params.history_lengths.max,
-         max_index_sz = log2Up(params.table_sizes.max),
+         max_index_sz = log2Ceil(params.table_sizes.max),
          max_tag_sz = params.tag_sizes.max,
          cntr_sz = params.cntr_sz,
          ubit_sz = params.ubit_sz)
@@ -108,7 +100,6 @@ object TageBrPredictor
 //--------------------------------------------------------------------------
 
 class TageBrPredictor(
-   fetch_width: Int,
    num_tables: Int,
    table_sizes: Seq[Int],
    history_lengths: Seq[Int],
@@ -117,7 +108,6 @@ class TageBrPredictor(
    ubit_sz: Int
    )(implicit p: Parameters)
    extends BrPredictor(
-      fetch_width    = fetch_width,
       history_length = history_lengths.max)(p)
 {
    val size_in_bits = (for (i <- 0 until num_tables) yield
@@ -141,14 +131,14 @@ class TageBrPredictor(
    def GetProviderTableId(hits:IndexedSeq[Bool]): UInt =
    {
       // return the id of the highest table with a hit
-      PriorityMux(hits.reverse, (num_tables-1 to 0 by -1).map(UInt(_)))
+      PriorityMux(hits.reverse, (num_tables-1 to 0 by -1).map(_.U))
    }
 
    def GetAlternateTableId(hits:IndexedSeq[Bool]): (Bool, UInt) =
    {
       // return the id of the 2nd highest table with a hit
       // also returns whether a 2nd hit was found (PopCount(hits) > 1)
-      val alt_id = Wire(init=0.U)
+      val alt_id = WireInit(0.U)
       var found_first = false.B
       var found_second = false.B
       for (i <- num_tables-1 to 0 by -1)
@@ -171,10 +161,10 @@ class TageBrPredictor(
    // of all zeroes.
    private def GetPredictionOH(cidx: UInt, cntr: UInt): UInt =
    {
-      val mask_oh = Wire(UInt(width=fetch_width.W))
+      val mask_oh = Wire(UInt(rvcFetchWidth.W))
       // Check high-order bit for prediction.
       val taken = cntr(cntr_sz-1)
-      mask_oh := UIntToOH(cidx) & Fill(fetch_width, taken)
+      mask_oh := UIntToOH(cidx) & Fill(rvcFetchWidth, taken)
       mask_oh
    }
 
@@ -192,7 +182,7 @@ class TageBrPredictor(
    private def TagHashTerribad(addr: UInt, hist: UInt, hlen: Int, idx_sz: Int): UInt =
    {
       //val tag = Fold(hist, idx_sz, hlen) ^ addr
-      val tag = ((addr >> 4.U) & 0xf.U) | ((hist & 0xf.U) << 4.U)
+      val tag = ((addr >> 4.U) & "hf".U) | ((hist & "hf".U) << 4.U)
       tag
    }
 
@@ -206,7 +196,6 @@ class TageBrPredictor(
    val tables = for (i <- 0 until num_tables) yield
    {
       val table = Module(new TageTable(
-         fetch_width        = fetch_width,
          id                 = i,
          num_entries        = table_sizes(i),
          history_length     = history_lengths(i),
@@ -222,7 +211,7 @@ class TageBrPredictor(
       table
    }
 
-   val tables_io = Vec(tables.map(_.io))
+   val tables_io = VecInit(tables.map(_.io))
 
 
    // perform index hash
@@ -250,14 +239,19 @@ class TageBrPredictor(
    // Match the other ElasticRegs in the FrontEnd.
    val q_f3_resps = for (i <- 0 until num_tables) yield
    {
-      val q_resp = withReset(reset || io.fe_clear || io.f4_redirect)
-       {Module(new ElasticReg(Valid(new TageTableResp(fetch_width, tag_sizes.max, cntr_sz, ubit_sz))))}
+      val q_resp = withReset(reset.toBool || io.fe_clear || io.f4_redirect)
+       {Module(new ElasticReg(Valid(new TageTableResp(rvcFetchWidth, tag_sizes.max, cntr_sz, ubit_sz))))}
 
       q_resp.io.enq.valid := io.f2_valid
       q_resp.io.enq.bits := tables_io(i).bp2_resp
       q_resp.io.deq.ready := io.resp.ready
 
-      assert (q_resp.io.enq.ready === !io.f2_stall)
+      val table_reg = RegEnable(tables_io(i).bp2_resp, io.capture)
+      when (io.s3_valid) {
+         q_resp.io.enq.bits  := table_reg
+      }
+
+      //assert (q_resp.io.enq.ready === !io.f2_stall)
       assert (q_resp.io.deq.valid === q_f3_history.io.deq.valid)
 
       q_resp
@@ -281,18 +275,18 @@ class TageBrPredictor(
    }
 
    // Vector/bit-mask of taken/not-taken predictions.
-   val f3_takens = Wire(init = Vec.fill(fetch_width) { false.B })
+   val f3_takens = WireInit(VecInit(Seq.fill(rvcFetchWidth) { false.B }))
    // Vector of best predictors (one for each cfi index).
-   val f3_best_hits = Wire(init = Vec.fill(fetch_width) { false.B })
-   val f3_best_ids  = Wire(Vec(fetch_width, UInt(width=log2Ceil(num_tables))))
+   val f3_best_hits = WireInit(VecInit(Seq.fill(rvcFetchWidth) { false.B }))
+   val f3_best_ids  = Wire(Vec(rvcFetchWidth, UInt(log2Ceil(num_tables).W)))
    // Vector of alt predictors (one for each cfi index).
-   val f3_alt_hits  = Wire(init = Vec.fill(fetch_width) { false.B })
-   val f3_alt_ids   = Wire(Vec(fetch_width, UInt(width=log2Ceil(num_tables))))
+   val f3_alt_hits  = WireInit(VecInit(Seq.fill(rvcFetchWidth) { false.B }))
+   val f3_alt_ids   = Wire(Vec(rvcFetchWidth, UInt(log2Ceil(num_tables).W)))
 
    // Build up a bit-mask of taken predictions (1 bit per cfi index).
    // Build up a best predictor (one per cfi index).
    // Build up an alt predictor (one per cfi index).
-   for (w <- 0 until fetch_width) yield
+   for (w <- 0 until rvcFetchWidth) yield
    {
       val found_first = f3_hits_matrix.map{mask => mask(w)}.reduce(_|_)
 
@@ -307,7 +301,7 @@ class TageBrPredictor(
       // TODO allow use_alt
       f3_takens(w) :=
          Mux(f3_best_hits(w),
-            Vec(f3_predictions)(f3_best_ids(w)).predictsTaken,
+            VecInit(f3_predictions)(f3_best_ids(w)).predictsTaken,
             false.B)
    }
 
@@ -326,28 +320,35 @@ class TageBrPredictor(
          PriorityEncoder(f3_best_hits)) // TODO allow use_alt
 
    val resp_info = Wire(new TageResp(
-      fetch_width = fetch_width,
+      fetch_width = rvcFetchWidth,
       num_tables = num_tables,
       max_history_length = history_lengths.max,
-      max_index_sz = log2Up(table_sizes.max),
+      max_index_sz = log2Ceil(table_sizes.max),
       max_tag_sz = tag_sizes.max,
       cntr_sz = cntr_sz,
       ubit_sz = ubit_sz))
 
    val f3_has_hit = f3_best_hits.reduce(_|_)
-   val f3_pred = Vec(f3_predictions)(f3_best_ids(predicted_cidx))
+   val f3_pred = VecInit(f3_predictions)(f3_best_ids(predicted_cidx))
 
    assert (!(f3_has_hit && !f3_best_hits(predicted_cidx)), "[tage] was a hit but our cidx is wrong.")
 
-   io.resp.valid       := f3_has_hit || io.f2_bim_resp.valid
+   val q_s3_resp = withReset(reset.toBool || io.fe_clear || io.f4_redirect)
+      {Module(new ElasticReg(Valid(new BimResp)))}
+
+   q_s3_resp.io.enq.valid := io.f2_valid
+   q_s3_resp.io.enq.bits := io.f2_bim_resp
+   q_s3_resp.io.deq.ready := io.resp.ready
+
+   io.resp.valid       := f3_has_hit || (q_s3_resp.io.deq.valid && q_s3_resp.io.deq.bits.valid)
    io.resp.bits.takens := Mux(f3_has_hit,
                               GetPredictionOH(f3_pred.cidx, f3_pred.cntr),
-                              io.f2_bim_resp.bits.getTakens)
+                              q_s3_resp.io.deq.bits.bits.getTakens)
 
-   resp_info.tags    := Vec(f3_predictions.map(_.tag))
-   resp_info.cntrs   := Vec(f3_predictions.map(_.cntr))
-   resp_info.cidxs   := Vec(f3_predictions.map(_.cidx))
-   resp_info.ubits   := Vec(f3_predictions.map(_.ubit))
+   resp_info.tags    := VecInit(f3_predictions.map(_.tag))
+   resp_info.cntrs   := VecInit(f3_predictions.map(_.cntr))
+   resp_info.cidxs   := VecInit(f3_predictions.map(_.cidx))
+   resp_info.ubits   := VecInit(f3_predictions.map(_.ubit))
 
    resp_info.debug_indexes := RegEnable(bp1_idxs, f1_valid)
    resp_info.debug_tags    := RegEnable(bp1_tags, f1_valid)
@@ -367,15 +368,15 @@ class TageBrPredictor(
    // update predictor during commit
 
    val r_commit = RegNext(io.commit)
-   val r_info = new TageResp(
-      fetch_width = fetch_width,
+   val r_info = r_commit.bits.info.asTypeOf(new TageResp(
+      fetch_width = rvcFetchWidth,
       num_tables = num_tables,
       max_history_length = history_lengths.max,
-      max_index_sz = log2Up(table_sizes.max),
+      max_index_sz = log2Ceil(table_sizes.max),
       max_tag_sz = tag_sizes.max,
       cntr_sz = cntr_sz,
       ubit_sz = ubit_sz
-   ).fromBits(r_commit.bits.info)
+   ))
 
 
    val com_indexes = history_lengths zip table_sizes map { case (hlen, tsize)  =>
@@ -399,10 +400,10 @@ class TageBrPredictor(
 
    // Are we going to perform a write to the table?
    // What action are we going to perform? Allocate? Update? Or Degrade?
-   val table_wens       = Wire(init = Vec.fill(num_tables) {false.B})
-   val table_allocates  = Wire(init = Vec.fill(num_tables) {false.B})
-   val table_updates    = Wire(init = Vec.fill(num_tables) {false.B})
-   val table_degrades   = Wire(init = Vec.fill(num_tables) {false.B})
+   val table_wens       = WireInit(VecInit(Seq.fill(num_tables) {false.B}))
+   val table_allocates  = WireInit(VecInit(Seq.fill(num_tables) {false.B}))
+   val table_updates    = WireInit(VecInit(Seq.fill(num_tables) {false.B}))
+   val table_degrades   = WireInit(VecInit(Seq.fill(num_tables) {false.B}))
 
 
    when (r_commit.valid)
@@ -469,7 +470,7 @@ class TageBrPredictor(
       when (table_wens(i))
       {
          // construct old entry so we can overwrite parts without having to do a RMW.
-         val com_entry = Wire(new TageTableEntry(fetch_width, tag_sizes.max, cntr_sz, ubit_sz))
+         val com_entry = Wire(new TageTableEntry(rvcFetchWidth, tag_sizes.max, cntr_sz, ubit_sz))
          com_entry.tag  := Mux(table_allocates(i), com_tags(i), r_info.tags(i))
          com_entry.cntr := r_info.cntrs(i)
          com_entry.cidx := Mux(table_allocates(i), r_commit.bits.miss_cfi_idx,  r_info.cidxs(i))
@@ -498,7 +499,5 @@ class TageBrPredictor(
       "\n   " + (size_in_bits/8/1024.0) + " kB TAGE Predictor (" +
       (size_in_bits/1024) + " Kbits) (max history length: " + history_lengths.max + " bits)\n" +
       tables.mkString("\n")
-
-   override val compileOptions = chisel3.core.ExplicitCompileOptions.NotStrict.copy(explicitInvalidate = true)
 }
 

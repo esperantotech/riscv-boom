@@ -3,7 +3,7 @@
 
 package boom.common
 
-import Chisel._
+import chisel3._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.devices.tilelink._
@@ -21,7 +21,6 @@ case class BoomTileParams(
     core: BoomCoreParams = BoomCoreParams(),
     icache: Option[ICacheParams] = Some(ICacheParams()),
     dcache: Option[DCacheParams] = Some(DCacheParams()),
-    rocc: Seq[RoCCParams] = Nil,
     btb: Option[BTBParams] = Some(BTBParams()),
     dataScratchpadBytes: Int = 0,
     trace: Boolean = false,
@@ -40,10 +39,10 @@ class BoomTile(
     crossing: SubsystemClockCrossing)
   (implicit p: Parameters) extends BaseTile(boomParams, crossing)(p)
     with HasExternalInterrupts
-    //with HasLazyRoCC  // implies CanHaveSharedFPU with CanHavePTW with HasHellaCache
     with CanHaveBoomPTW
     with HasBoomHellaCache
     with HasBoomICacheFrontend {
+    //with HasLazyRoCC  // implies CanHaveSharedFPU with CanHavePTW with HasHellaCache
 
   val intOutwardNode = IntIdentityNode()
   val slaveNode = TLIdentityNode()
@@ -88,33 +87,52 @@ class BoomTile(
   val itimProperty = tileParams.icache.flatMap(_.itimAddr.map(i => Map(
     "sifive,itim" -> frontend.icache.device.asProperty))).getOrElse(Nil)
 
-  val cpuDevice = new Device {
-    def describe(resources: ResourceBindings): Description =
-      toDescription(resources)("sifive,rocket0", dtimProperty ++ itimProperty)
+  val cpuDevice = new SimpleDevice("cpu", Seq("ucbbar,boom0", "riscv")) {
+    override def parent = Some(ResourceAnchors.cpus)
+    override def describe(resources: ResourceBindings): Description = {
+      val Description(name, mapping) = super.describe(resources)
+      Description(name, mapping ++ cpuProperties ++ nextLevelCacheProperty ++ tileProperties ++ dtimProperty ++ itimProperty)
+    }
   }
 
   ResourceBinding {
-    Resource(cpuDevice, "reg").bind(ResourceInt(BigInt(hartId)))
+    Resource(cpuDevice, "reg").bind(ResourceAddress(hartId))
   }
 
   override lazy val module = new BoomTileModuleImp(this)
+
+  override def makeMasterBoundaryBuffers(implicit p: Parameters) = {
+    if (!boomParams.boundaryBuffers) super.makeMasterBoundaryBuffers
+    else TLBuffer(BufferParams.none, BufferParams.flow, BufferParams.none, BufferParams.flow, BufferParams(1))
+  }
+
+  override def makeSlaveBoundaryBuffers(implicit p: Parameters) = {
+    if (!boomParams.boundaryBuffers) super.makeSlaveBoundaryBuffers
+    else TLBuffer(BufferParams.flow, BufferParams.none, BufferParams.none, BufferParams.none, BufferParams.none)
+  }
 }
 
 class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer)
-    //with HasLazyRoCCModule[BoomTile]
     with CanHaveBoomPTWModule
     with HasBoomHellaCacheModule
     with HasBoomICacheFrontendModule {
+    //with HasLazyRoCCModule[BoomTile]
+    Annotated.params(this, outer.boomParams)
 
   val core = Module(new BoomCore()(outer.p, outer.dcache.module.edge))
+  core.io.rocc := DontCare
+  core.io.fpu := DontCare
+  core.io.reset_vector := DontCare
+
+  //val fpuOpt = outer.tileParams.core.fpu.map(params => Module(new FPU(params)(outer.p))) RocketFpu - not needed in boom
 
   // Observe the Tilelink Channel C traffic leaving the L1D (writeback/releases).
   val tl_c = outer.dCacheTap.out(0)._1.c
   core.io.release.valid := tl_c.fire()
   core.io.release.bits.address := tl_c.bits.address
 
-  val uncorrectable = RegInit(Bool(false))
-  val halt_and_catch_fire = outer.boomParams.hcfOnUncorrectable.option(IO(Bool(OUTPUT)))
+  val uncorrectable = RegInit(false.B)
+  val halt_and_catch_fire = outer.boomParams.hcfOnUncorrectable.option(IO(Output(Bool())))
 
   outer.dtim_adapter.foreach { lm => dcachePorts += lm.module.io.dmem }
 
@@ -133,7 +151,7 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer)
   outer.frontend.module.io.hartid := constants.hartid
   outer.dcache.module.io.hartid := constants.hartid
   dcachePorts += core.io.dmem // TODO outer.dcachePorts += () => module.core.io.dmem ??
-  fpuOpt foreach { fpu => core.io.fpu <> fpu.io }
+  //fpuOpt foreach { fpu => core.io.fpu <> fpu.io } RocketFpu - not needed in boom
   core.io.ptw <> ptw.io.dpath
   //roccCore.cmd <> core.io.rocc.cmd
   //roccCore.exception := core.io.rocc.exception
